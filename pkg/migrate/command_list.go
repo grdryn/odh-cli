@@ -14,6 +14,7 @@ import (
 
 	"github.com/opendatahub-io/odh-cli/pkg/cmd"
 	"github.com/opendatahub-io/odh-cli/pkg/migrate/action"
+	"github.com/opendatahub-io/odh-cli/pkg/migrate/actions/dashboard/redirect"
 	"github.com/opendatahub-io/odh-cli/pkg/migrate/actions/kueue/rhbok"
 	"github.com/opendatahub-io/odh-cli/pkg/printer/table"
 	"github.com/opendatahub-io/odh-cli/pkg/util/iostreams"
@@ -50,6 +51,7 @@ func NewListCommand(streams genericiooptions.IOStreams) *ListCommand {
 
 	// Explicitly register all actions (no global state, full test isolation)
 	registry.MustRegister(&rhbok.RHBOKMigrationAction{})
+	registry.MustRegister(&redirect.DashboardRedirectAction{})
 
 	return &ListCommand{
 		SharedOptions: shared,

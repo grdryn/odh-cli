@@ -12,6 +12,7 @@ import (
 
 	"github.com/opendatahub-io/odh-cli/pkg/cmd"
 	"github.com/opendatahub-io/odh-cli/pkg/migrate/action"
+	"github.com/opendatahub-io/odh-cli/pkg/migrate/actions/dashboard/redirect"
 	"github.com/opendatahub-io/odh-cli/pkg/migrate/actions/kueue/rhbok"
 	"github.com/opendatahub-io/odh-cli/pkg/util/version"
 )
@@ -41,6 +42,7 @@ func NewRunCommand(streams genericiooptions.IOStreams) *RunCommand {
 
 	// Explicitly register all actions (no global state, full test isolation)
 	registry.MustRegister(&rhbok.RHBOKMigrationAction{})
+	registry.MustRegister(&redirect.DashboardRedirectAction{})
 
 	return &RunCommand{
 		SharedOptions: shared,
