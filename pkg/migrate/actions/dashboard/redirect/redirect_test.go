@@ -28,7 +28,7 @@ func createFakeClient(scheme *runtime.Scheme, objects ...runtime.Object) (*dynam
 		resources.ConsoleLink.GVR():        "ConsoleLinkList",
 		resources.Route.GVR():              "RouteList",
 		resources.ConfigMap.GVR():          "ConfigMapList",
-		resources.Pod.GVR():                "PodList",
+		resources.Deployment.GVR():         "DeploymentList",
 		resources.Service.GVR():            "ServiceList",
 	}
 	dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, listKinds, objects...)
@@ -360,6 +360,41 @@ func TestDashboardRedirectAction_Execute(t *testing.T) {
 				patchAction := act.(clienttesting.PatchAction)
 				if patchAction.GetName() == "rhods-dashboard" {
 					g.Expect(string(patchAction.GetPatch())).To(ContainSubstring("custom-dashboard.apps.cluster.com"))
+				}
+			}
+		}
+	})
+
+	t.Run("Missing scheme in redirect URL override adds https://", func(t *testing.T) {
+		g := NewWithT(t)
+		// No ConsoleLink or Route objects - auto-discovery would fail
+		dynamicClient, testClient := createFakeClient(scheme, rhoaiDashboardConfig)
+
+		_, in, out, errOut := genericiooptions.NewTestIOStreams()
+		ioStreams := iostreams.NewIOStreams(in, out, errOut)
+		recorder := action.NewVerboseRootRecorder(ioStreams)
+
+		target := action.Target{
+			Client:   testClient,
+			DryRun:   false,
+			Recorder: recorder,
+			IO:       ioStreams,
+		}
+
+		a := &redirect.DashboardRedirectAction{
+			RedirectURL: "custom-dashboard.apps.cluster.com",
+		}
+		res, err := a.Run().Execute(context.Background(), target)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeTrue())
+
+		expectAppliedResources(g, dynamicClient, "nginx-redirect-config", "rhods-dashboard")
+
+		for _, act := range dynamicClient.Actions() {
+			if act.GetVerb() == "patch" {
+				patchAction := act.(clienttesting.PatchAction)
+				if patchAction.GetName() == "nginx-redirect-config" {
+					g.Expect(string(patchAction.GetPatch())).To(ContainSubstring("https://custom-dashboard.apps.cluster.com"))
 				}
 			}
 		}

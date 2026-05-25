@@ -1,16 +1,17 @@
 package redirect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"text/template"
 
 	"github.com/spf13/pflag"
 	"sigs.k8s.io/yaml"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -41,6 +42,7 @@ const (
 	msgStepApplyResources      = "Apply nginx-redirect resources"
 	msgApplyDesc               = "Apply %s"
 	msgWouldApply              = "Would apply %s"
+	msgTemplateRenderFailed    = "Failed to render template %q: %v"
 	msgUnmarshalFailed         = "Failed to unmarshal YAML: %v"
 	msgApplyResourcesFailed    = "Failed to apply resources"
 	msgApplyFailed             = "Failed to apply resource: %v"
@@ -84,25 +86,35 @@ type runTask struct {
 	action *DashboardRedirectAction
 }
 
-func (t *runTask) Validate(ctx context.Context, target action.Target) (*result.ActionResult, error) {
+type preflightResult struct {
+	info        platformInfo
+	redirectURL string
+}
+
+// preflight performs the common read-only checks shared by Validate and Execute:
+// platform detection and redirect URL discovery. It records step results onto
+// target.Recorder and returns early (with a built ActionResult) on failure.
+// On success it returns a non-nil *preflightResult; the caller is responsible
+// for calling rootRecorder.Build() after any additional work.
+func (t *runTask) preflight(ctx context.Context, target action.Target) (*preflightResult, action.RootRecorder, error) {
 	rootRecorder, ok := target.Recorder.(action.RootRecorder)
 	if !ok {
-		return nil, errors.New(msgErrNotRootRecorder)
+		return nil, nil, errors.New(msgErrNotRootRecorder)
 	}
 
 	info := detectPlatform(ctx, target)
 	if info.PlatformType == "" {
 		target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepFailed, msgPlatformDetectFailed)
 
-		return rootRecorder.Build(), nil
+		return nil, rootRecorder, nil
 	}
 	target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepCompleted, msgPlatformDetected, info.PlatformType, info.Namespace)
 
-	redirectURL := t.resolveRedirectURL(ctx, target)
+	redirectURL := t.resolveRedirectURL(ctx, target, info.Namespace)
 	if redirectURL == "" {
 		target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepFailed, msgURLDiscoverFailed)
 
-		return rootRecorder.Build(), nil
+		return nil, rootRecorder, nil
 	}
 
 	urlMsg := msgURLDiscovered
@@ -110,48 +122,43 @@ func (t *runTask) Validate(ctx context.Context, target action.Target) (*result.A
 		urlMsg = msgURLOverride
 	}
 	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, urlMsg, redirectURL)
+
+	return &preflightResult{info: info, redirectURL: redirectURL}, rootRecorder, nil
+}
+
+func (t *runTask) Validate(ctx context.Context, target action.Target) (*result.ActionResult, error) {
+	_, rootRecorder, err := t.preflight(ctx, target)
+	if err != nil {
+		return nil, err
+	}
 
 	return rootRecorder.Build(), nil
 }
 
 func (t *runTask) Execute(ctx context.Context, target action.Target) (*result.ActionResult, error) {
-	rootRecorder, ok := target.Recorder.(action.RootRecorder)
-	if !ok {
-		return nil, errors.New(msgErrNotRootRecorder)
+	pf, rootRecorder, err := t.preflight(ctx, target)
+	if err != nil {
+		return nil, err
 	}
 
-	info := detectPlatform(ctx, target)
-	if info.PlatformType == "" {
-		target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepFailed, msgPlatformDetectFailed)
-
-		return rootRecorder.Build(), nil
+	if pf != nil {
+		applyResources(ctx, target, pf.info.Namespace, pf.info.RouteName, pf.redirectURL, t.action.RouteHost)
 	}
-	target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepCompleted, msgPlatformDetected, info.PlatformType, info.Namespace)
-
-	redirectURL := t.resolveRedirectURL(ctx, target)
-	if redirectURL == "" {
-		target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepFailed, msgURLDiscoverFailed)
-
-		return rootRecorder.Build(), nil
-	}
-
-	urlMsg := msgURLDiscovered
-	if t.action.RedirectURL != "" {
-		urlMsg = msgURLOverride
-	}
-	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, urlMsg, redirectURL)
-
-	applyResources(ctx, target, info.Namespace, info.RouteName, redirectURL, t.action.RouteHost)
 
 	return rootRecorder.Build(), nil
 }
 
-func (t *runTask) resolveRedirectURL(ctx context.Context, target action.Target) string {
+func (t *runTask) resolveRedirectURL(ctx context.Context, target action.Target, namespace string) string {
 	if t.action.RedirectURL != "" {
-		return strings.TrimRight(t.action.RedirectURL, "/")
+		urlStr := strings.TrimRight(t.action.RedirectURL, "/")
+		if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
+			urlStr = "https://" + urlStr
+		}
+
+		return urlStr
 	}
 
-	return discoverRedirectURL(ctx, target)
+	return discoverRedirectURL(ctx, target, namespace)
 }
 
 type platformInfo struct {
@@ -217,7 +224,7 @@ func detectPlatformFromSubscription(ctx context.Context, target action.Target) p
 	return platformInfo{}
 }
 
-func discoverRedirectURL(ctx context.Context, target action.Target) string {
+func discoverRedirectURL(ctx context.Context, target action.Target, namespace string) string {
 	links, err := target.Client.Dynamic().Resource(resources.ConsoleLink.GVR()).List(ctx, metav1.ListOptions{})
 	if err == nil {
 		for _, link := range links.Items {
@@ -231,14 +238,14 @@ func discoverRedirectURL(ctx context.Context, target action.Target) string {
 		}
 	}
 
-	routes, err := target.Client.Dynamic().Resource(resources.Route.GVR()).Namespace("").List(ctx, metav1.ListOptions{})
+	routes, err := target.Client.Dynamic().Resource(resources.Route.GVR()).Namespace(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: "metadata.name=data-science-gateway",
+	})
 	if err == nil {
 		for _, route := range routes.Items {
-			if route.GetName() == "data-science-gateway" {
-				host, _ := jq.Query[string](&route, ".spec.host")
-				if host != "" {
-					return "https://" + host
-				}
+			host, _ := jq.Query[string](&route, ".spec.host")
+			if host != "" {
+				return "https://" + host
 			}
 		}
 	}
@@ -246,58 +253,95 @@ func discoverRedirectURL(ctx context.Context, target action.Target) string {
 	return ""
 }
 
+type redirectTemplateData struct {
+	Namespace   string
+	RedirectURL string
+	RouteName   string
+	RouteHost   string
+	LegacyHost  string
+}
+
+func renderTemplate(name, tmpl string, data redirectTemplateData) (string, error) {
+	t, err := template.New(name).Parse(tmpl)
+	if err != nil {
+		return "", fmt.Errorf("parsing template %q: %w", name, err)
+	}
+
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("executing template %q: %w", name, err)
+	}
+
+	return buf.String(), nil
+}
+
 func applyResources(ctx context.Context, target action.Target, namespace, routeName, redirectURL, routeHost string) {
 	step := target.Recorder.Child("apply-redirect-resources", msgStepApplyResources)
 
-	configMapYAML := fmt.Sprintf(`
+	data := redirectTemplateData{
+		Namespace:   namespace,
+		RedirectURL: redirectURL,
+		RouteName:   routeName,
+		RouteHost:   routeHost,
+	}
+
+	configMapTmpl := `
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: nginx-redirect-config
-  namespace: %s
+  namespace: {{ .Namespace }}
   labels:
     app: nginx-redirect
 data:
   redirect.conf: |
     location / {
-        return 301 %s$request_uri;
+        return 301 {{ .RedirectURL }}$request_uri;
     }
-`, namespace, redirectURL)
+`
 
-	podYAML := fmt.Sprintf(`
-apiVersion: v1
-kind: Pod
+	deploymentTmpl := `
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: nginx-redirect
-  namespace: %s
+  namespace: {{ .Namespace }}
   labels:
     app: nginx-redirect
 spec:
-  restartPolicy: Always
-  containers:
-  - name: nginx
-    image: registry.redhat.io/ubi9/nginx-126:latest
-    command:
-    - /usr/libexec/s2i/run
-    ports:
-    - containerPort: 8080
-      protocol: TCP
-    volumeMounts:
-    - name: nginx-config
-      mountPath: /opt/app-root/etc/nginx.default.d/redirect.conf
-      subPath: redirect.conf
-  volumes:
-  - name: nginx-config
-    configMap:
-      name: nginx-redirect-config
-`, namespace)
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-redirect
+  template:
+    metadata:
+      labels:
+        app: nginx-redirect
+    spec:
+      containers:
+      - name: nginx
+        image: registry.redhat.io/ubi9/nginx-126:latest
+        command:
+        - /usr/libexec/s2i/run
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /opt/app-root/etc/nginx.default.d/redirect.conf
+          subPath: redirect.conf
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: nginx-redirect-config
+`
 
-	serviceYAML := fmt.Sprintf(`
+	serviceTmpl := `
 apiVersion: v1
 kind: Service
 metadata:
   name: nginx-redirect
-  namespace: %s
+  namespace: {{ .Namespace }}
   labels:
     app: nginx-redirect
 spec:
@@ -309,67 +353,23 @@ spec:
   selector:
     app: nginx-redirect
   type: ClusterIP
-`, namespace)
+`
 
-	hostLine := ""
-	if routeHost != "" {
-		hostLine = fmt.Sprintf("  host: %s\n", routeHost)
-	}
-
-	routeYAML := fmt.Sprintf(`
+	routeTmpl := `
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: %s
-  namespace: %s
+  name: {{ .RouteName }}
+  namespace: {{ .Namespace }}
   annotations:
     haproxy.router.openshift.io/hsts_header: max-age=31536000;includeSubDomains;preload
     kubernetes.io/tls-acme: "true"
   labels:
     app: nginx-redirect
 spec:
-%s  port:
-    targetPort: http
-  tls:
-    insecureEdgeTerminationPolicy: Redirect
-    termination: edge
-  to:
-    kind: Service
-    name: nginx-redirect
-    weight: 100
-  wildcardPolicy: None
-`, routeName, namespace, hostLine)
-
-	resourcesToApply := []struct {
-		desc string
-		yaml string
-		res  resources.ResourceType
-	}{
-		{"ConfigMap", configMapYAML, resources.ConfigMap},
-		{"Pod", podYAML, resources.Pod},
-		{"Service", serviceYAML, resources.Service},
-		{"Route", routeYAML, resources.Route},
-	}
-
-	if strings.Contains(redirectURL, "rh-ai") {
-		parsed, err := url.Parse(redirectURL)
-		if err == nil && parsed.Hostname() != "" {
-			parts := strings.SplitN(parsed.Hostname(), ".", maxDomainParts)
-			if len(parts) > 1 {
-				legacyHost := "data-science-gateway." + parts[1]
-				legacyRouteYAML := fmt.Sprintf(`
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata:
-  name: data-science-gateway-legacy
-  namespace: %s
-  annotations:
-    haproxy.router.openshift.io/hsts_header: max-age=31536000;includeSubDomains;preload
-    kubernetes.io/tls-acme: "true"
-  labels:
-    app: nginx-redirect
-spec:
-  host: %s
+{{- if .RouteHost }}
+  host: {{ .RouteHost }}
+{{- end }}
   port:
     targetPort: http
   tls:
@@ -380,17 +380,58 @@ spec:
     name: nginx-redirect
     weight: 100
   wildcardPolicy: None
-`, namespace, legacyHost)
-				resourcesToApply = append(resourcesToApply, struct {
-					desc string
-					yaml string
-					res  resources.ResourceType
-				}{"Legacy Route", legacyRouteYAML, resources.Route})
+`
+
+	type resourceSpec struct {
+		desc string
+		tmpl string
+		res  resources.ResourceType
+	}
+
+	toApply := []resourceSpec{
+		{"ConfigMap", configMapTmpl, resources.ConfigMap},
+		{"Deployment", deploymentTmpl, resources.Deployment},
+		{"Service", serviceTmpl, resources.Service},
+		{"Route", routeTmpl, resources.Route},
+	}
+
+	if strings.Contains(redirectURL, "rh-ai") {
+		parsed, err := url.Parse(redirectURL)
+		if err == nil && parsed.Hostname() != "" {
+			parts := strings.SplitN(parsed.Hostname(), ".", maxDomainParts)
+			if len(parts) > 1 {
+				data.LegacyHost = "data-science-gateway." + parts[1]
+
+				legacyRouteTmpl := `
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: data-science-gateway-legacy
+  namespace: {{ .Namespace }}
+  annotations:
+    haproxy.router.openshift.io/hsts_header: max-age=31536000;includeSubDomains;preload
+    kubernetes.io/tls-acme: "true"
+  labels:
+    app: nginx-redirect
+spec:
+  host: {{ .LegacyHost }}
+  port:
+    targetPort: http
+  tls:
+    insecureEdgeTerminationPolicy: Redirect
+    termination: edge
+  to:
+    kind: Service
+    name: nginx-redirect
+    weight: 100
+  wildcardPolicy: None
+`
+				toApply = append(toApply, resourceSpec{"Legacy Route", legacyRouteTmpl, resources.Route})
 			}
 		}
 	}
 
-	for _, r := range resourcesToApply {
+	for _, r := range toApply {
 		child := step.Child("apply-"+strings.ToLower(strings.ReplaceAll(r.desc, " ", "-")), fmt.Sprintf(msgApplyDesc, r.desc))
 
 		if target.DryRun {
@@ -399,16 +440,24 @@ spec:
 			continue
 		}
 
+		rendered, err := renderTemplate(r.desc, r.tmpl, data)
+		if err != nil {
+			child.Complete(result.StepFailed, msgTemplateRenderFailed, r.desc, err)
+			step.Complete(result.StepFailed, msgApplyResourcesFailed)
+
+			return
+		}
+
 		var obj unstructured.Unstructured
-		if err := yaml.Unmarshal([]byte(r.yaml), &obj.Object); err != nil {
+		if err := yaml.Unmarshal([]byte(rendered), &obj.Object); err != nil {
 			child.Complete(result.StepFailed, msgUnmarshalFailed, err)
 			step.Complete(result.StepFailed, msgApplyResourcesFailed)
 
 			return
 		}
 
-		_, err := target.Client.Dynamic().Resource(r.res.GVR()).Namespace(namespace).Apply(ctx, obj.GetName(), &obj, metav1.ApplyOptions{FieldManager: "odh-cli", Force: true})
-		if err != nil && !apierrors.IsAlreadyExists(err) {
+		_, err = target.Client.Dynamic().Resource(r.res.GVR()).Namespace(namespace).Apply(ctx, obj.GetName(), &obj, metav1.ApplyOptions{FieldManager: "odh-cli", Force: true})
+		if err != nil {
 			child.Complete(result.StepFailed, msgApplyFailed, err)
 			step.Complete(result.StepFailed, msgApplyResourcesFailed)
 
