@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/spf13/pflag"
 	"sigs.k8s.io/yaml"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,6 +37,7 @@ const (
 	msgStepDiscoverURL         = "Discover redirect URL"
 	msgURLDiscoverFailed       = "Unable to discover redirect URL"
 	msgURLDiscovered           = "Discovered redirect URL: %s"
+	msgURLOverride             = "Using override redirect URL: %s"
 	msgStepApplyResources      = "Apply nginx-redirect resources"
 	msgApplyDesc               = "Apply %s"
 	msgWouldApply              = "Would apply %s"
@@ -47,7 +49,19 @@ const (
 	msgApplyResourcesCompleted = "Successfully applied dashboard redirect resources"
 )
 
-type DashboardRedirectAction struct{}
+type DashboardRedirectAction struct {
+	RouteHost   string
+	RedirectURL string
+}
+
+var _ action.ActionConfigurer = (*DashboardRedirectAction)(nil)
+
+func (a *DashboardRedirectAction) AddFlags(fs *pflag.FlagSet) {
+	fs.StringVar(&a.RouteHost, "redirect-route-host", "",
+		"Override the hostname for the dashboard redirect route (for legacy custom URLs)")
+	fs.StringVar(&a.RedirectURL, "redirect-url", "",
+		"Override the auto-discovered redirect destination URL")
+}
 
 func (a *DashboardRedirectAction) ID() string                { return actionID }
 func (a *DashboardRedirectAction) Name() string              { return actionName }
@@ -84,13 +98,18 @@ func (t *runTask) Validate(ctx context.Context, target action.Target) (*result.A
 	}
 	target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepCompleted, msgPlatformDetected, info.PlatformType, info.Namespace)
 
-	redirectURL := discoverRedirectURL(ctx, target)
+	redirectURL := t.resolveRedirectURL(ctx, target)
 	if redirectURL == "" {
 		target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepFailed, msgURLDiscoverFailed)
 
 		return rootRecorder.Build(), nil
 	}
-	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, msgURLDiscovered, redirectURL)
+
+	urlMsg := msgURLDiscovered
+	if t.action.RedirectURL != "" {
+		urlMsg = msgURLOverride
+	}
+	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, urlMsg, redirectURL)
 
 	return rootRecorder.Build(), nil
 }
@@ -109,17 +128,30 @@ func (t *runTask) Execute(ctx context.Context, target action.Target) (*result.Ac
 	}
 	target.Recorder.Child("detect-platform", msgStepDetectPlatform).Complete(result.StepCompleted, msgPlatformDetected, info.PlatformType, info.Namespace)
 
-	redirectURL := discoverRedirectURL(ctx, target)
+	redirectURL := t.resolveRedirectURL(ctx, target)
 	if redirectURL == "" {
 		target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepFailed, msgURLDiscoverFailed)
 
 		return rootRecorder.Build(), nil
 	}
-	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, msgURLDiscovered, redirectURL)
 
-	applyResources(ctx, target, info.Namespace, info.RouteName, redirectURL)
+	urlMsg := msgURLDiscovered
+	if t.action.RedirectURL != "" {
+		urlMsg = msgURLOverride
+	}
+	target.Recorder.Child("discover-url", msgStepDiscoverURL).Complete(result.StepCompleted, urlMsg, redirectURL)
+
+	applyResources(ctx, target, info.Namespace, info.RouteName, redirectURL, t.action.RouteHost)
 
 	return rootRecorder.Build(), nil
+}
+
+func (t *runTask) resolveRedirectURL(ctx context.Context, target action.Target) string {
+	if t.action.RedirectURL != "" {
+		return strings.TrimRight(t.action.RedirectURL, "/")
+	}
+
+	return discoverRedirectURL(ctx, target)
 }
 
 type platformInfo struct {
@@ -214,7 +246,7 @@ func discoverRedirectURL(ctx context.Context, target action.Target) string {
 	return ""
 }
 
-func applyResources(ctx context.Context, target action.Target, namespace, routeName, redirectURL string) {
+func applyResources(ctx context.Context, target action.Target, namespace, routeName, redirectURL, routeHost string) {
 	step := target.Recorder.Child("apply-redirect-resources", msgStepApplyResources)
 
 	configMapYAML := fmt.Sprintf(`
@@ -279,6 +311,11 @@ spec:
   type: ClusterIP
 `, namespace)
 
+	hostLine := ""
+	if routeHost != "" {
+		hostLine = fmt.Sprintf("  host: %s\n", routeHost)
+	}
+
 	routeYAML := fmt.Sprintf(`
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -291,7 +328,7 @@ metadata:
   labels:
     app: nginx-redirect
 spec:
-  port:
+%s  port:
     targetPort: http
   tls:
     insecureEdgeTerminationPolicy: Redirect
@@ -301,7 +338,7 @@ spec:
     name: nginx-redirect
     weight: 100
   wildcardPolicy: None
-`, routeName, namespace)
+`, routeName, namespace, hostLine)
 
 	resourcesToApply := []struct {
 		desc string

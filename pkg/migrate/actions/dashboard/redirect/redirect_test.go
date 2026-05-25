@@ -302,4 +302,106 @@ func TestDashboardRedirectAction_Execute(t *testing.T) {
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(res.Status.Steps[1].Status).To(Equal(result.StepFailed))
 	})
+
+	t.Run("Redirect URL override bypasses auto-discovery", func(t *testing.T) {
+		g := NewWithT(t)
+		// No ConsoleLink or Route objects - auto-discovery would fail
+		dynamicClient, testClient := createFakeClient(scheme, rhoaiDashboardConfig)
+
+		_, in, out, errOut := genericiooptions.NewTestIOStreams()
+		ioStreams := iostreams.NewIOStreams(in, out, errOut)
+		recorder := action.NewVerboseRootRecorder(ioStreams)
+
+		target := action.Target{
+			Client:   testClient,
+			DryRun:   false,
+			Recorder: recorder,
+			IO:       ioStreams,
+		}
+
+		a := &redirect.DashboardRedirectAction{
+			RedirectURL: "https://custom-dashboard.apps.cluster.com",
+		}
+		res, err := a.Run().Execute(context.Background(), target)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeTrue())
+
+		expectAppliedResources(g, dynamicClient, "nginx-redirect-config", "rhods-dashboard")
+	})
+
+	t.Run("Route host override injects host into primary route", func(t *testing.T) {
+		g := NewWithT(t)
+		dynamicClient, testClient := createFakeClient(scheme, rhoaiDashboardConfig, consoleLink)
+
+		_, in, out, errOut := genericiooptions.NewTestIOStreams()
+		ioStreams := iostreams.NewIOStreams(in, out, errOut)
+		recorder := action.NewVerboseRootRecorder(ioStreams)
+
+		target := action.Target{
+			Client:   testClient,
+			DryRun:   false,
+			Recorder: recorder,
+			IO:       ioStreams,
+		}
+
+		a := &redirect.DashboardRedirectAction{
+			RouteHost: "custom-dashboard.apps.cluster.com",
+		}
+		res, err := a.Run().Execute(context.Background(), target)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeTrue())
+
+		// Verify the primary route was applied (the host is injected into the YAML)
+		expectAppliedResources(g, dynamicClient, "rhods-dashboard")
+
+		// Verify the patch payload contains the custom host
+		for _, act := range dynamicClient.Actions() {
+			if act.GetVerb() == "patch" {
+				patchAction := act.(clienttesting.PatchAction)
+				if patchAction.GetName() == "rhods-dashboard" {
+					g.Expect(string(patchAction.GetPatch())).To(ContainSubstring("custom-dashboard.apps.cluster.com"))
+				}
+			}
+		}
+	})
+
+	t.Run("Both overrides together", func(t *testing.T) {
+		g := NewWithT(t)
+		// No ConsoleLink or Route objects - auto-discovery would fail
+		dynamicClient, testClient := createFakeClient(scheme, rhoaiDashboardConfig)
+
+		_, in, out, errOut := genericiooptions.NewTestIOStreams()
+		ioStreams := iostreams.NewIOStreams(in, out, errOut)
+		recorder := action.NewVerboseRootRecorder(ioStreams)
+
+		target := action.Target{
+			Client:   testClient,
+			DryRun:   false,
+			Recorder: recorder,
+			IO:       ioStreams,
+		}
+
+		a := &redirect.DashboardRedirectAction{
+			RedirectURL: "https://custom-dashboard.apps.cluster.com",
+			RouteHost:   "old-dashboard.apps.cluster.com",
+		}
+		res, err := a.Run().Execute(context.Background(), target)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeTrue())
+
+		expectAppliedResources(g, dynamicClient, "nginx-redirect-config", "rhods-dashboard")
+
+		// Verify the route has custom host and the redirect URL is used
+		for _, act := range dynamicClient.Actions() {
+			if act.GetVerb() == "patch" {
+				patchAction := act.(clienttesting.PatchAction)
+				if patchAction.GetName() == "rhods-dashboard" {
+					g.Expect(string(patchAction.GetPatch())).To(ContainSubstring("old-dashboard.apps.cluster.com"))
+				}
+				if patchAction.GetName() == "nginx-redirect-config" {
+					g.Expect(string(patchAction.GetPatch())).To(ContainSubstring("custom-dashboard.apps.cluster.com"))
+				}
+			}
+		}
+	})
 }
