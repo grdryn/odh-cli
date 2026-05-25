@@ -44,6 +44,7 @@ func TestRecorder_NestedChildren(t *testing.T) {
 
 	actionResult := recorder.Build()
 	g.Expect(actionResult.Status.Steps).To(HaveLen(1))
+	g.Expect(actionResult.Status.Completed).To(BeFalse(), "Expected Completed to be false when a child step failed")
 
 	parentStep := actionResult.Status.Steps[0]
 	g.Expect(parentStep.Name).To(Equal("parent"))

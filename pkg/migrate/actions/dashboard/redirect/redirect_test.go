@@ -279,6 +279,7 @@ func TestDashboardRedirectAction_Execute(t *testing.T) {
 		a := &redirect.DashboardRedirectAction{}
 		res, err := a.Run().Execute(context.Background(), target)
 		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeFalse(), "Expected Completed to be false when platform detection fails")
 		g.Expect(res.Status.Steps[0].Status).To(Equal(result.StepFailed))
 	})
 
@@ -300,6 +301,7 @@ func TestDashboardRedirectAction_Execute(t *testing.T) {
 		a := &redirect.DashboardRedirectAction{}
 		res, err := a.Run().Execute(context.Background(), target)
 		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(res.Status.Completed).To(BeFalse(), "Expected Completed to be false when URL discovery fails")
 		g.Expect(res.Status.Steps[1].Status).To(Equal(result.StepFailed))
 	})
 
